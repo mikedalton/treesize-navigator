@@ -102,7 +102,6 @@ class FileIndex:
             child_bytes = self._subtree_bytes.get(child_path, 0)
             is_dir = child_path in self._children
             result.append(ChildEntry(child_name, child_bytes, is_dir))
-        result.sort(key=lambda e: e.total_bytes, reverse=True)
         return result
 
     def get_total(self, dir_path: str) -> int:
