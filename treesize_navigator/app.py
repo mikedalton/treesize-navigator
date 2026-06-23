@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
     Header,
@@ -20,6 +23,46 @@ from .indexer import ChildEntry, FileIndex, format_size
 
 BAR_WIDTH = 20
 _PARENT_NAME = "\x00__parent__"  # sentinel that can't appear in real filenames
+
+
+class YesNoScreen(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("y", "yes", "Yes", show=True),
+        Binding("n", "no", "No", show=True),
+        Binding("escape", "no", show=False),
+    ]
+    CSS = """
+    YesNoScreen {
+        align: center middle;
+    }
+    #yn-dialog {
+        background: $surface;
+        border: thick $primary;
+        padding: 1 3;
+        width: auto;
+        height: auto;
+        min-width: 44;
+    }
+    #yn-keys {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self._prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="yn-dialog"):
+            yield Label(self._prompt, markup=True)
+            yield Label("[bold]Y[/bold]es  /  [bold]N[/bold]o  /  Esc", id="yn-keys")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
 
 
 class EntryItem(ListItem):
@@ -121,6 +164,7 @@ class TreesizeApp(App[None]):
         self._cursor_history: dict[str, int] = {}
         self._loader = None
         self._quitting = False
+        self._was_indexed_fresh = False
 
     # ------------------------------------------------------------------ layout
 
@@ -143,7 +187,15 @@ class TreesizeApp(App[None]):
         self.query_one("#hint-bar").display = False
         self.query_one("#nav-list").display = False
         self.query_one("#sort-bar").display = False
-        self._loader = self._load_file()
+        cache_path = self.input_file + ".tsnidx"
+        if Path(cache_path).exists():
+            name = Path(self.input_file).name
+            self.push_screen(
+                YesNoScreen(f"Cache found for [bold]{name}[/bold]. Load from cache?"),
+                self._start_loading,
+            )
+        else:
+            self._start_loading(False)
 
     def on_unmount(self) -> None:
         if self._loader is not None:
@@ -151,9 +203,41 @@ class TreesizeApp(App[None]):
 
     # ------------------------------------------------------------------ loading
 
+    def _start_loading(self, use_cache: bool) -> None:
+        self._loader = self._load_file(use_cache)
+
     @work(thread=True, exit_on_error=False)
-    def _load_file(self) -> None:
+    def _load_file(self, use_cache: bool) -> None:
         worker = get_current_worker()
+        cache_path = self.input_file + ".tsnidx"
+
+        if use_cache:
+            try:
+                self.call_from_thread(
+                    self._set_loading_label, "Loading from cache…"
+                )
+            except Exception:
+                pass
+
+            def cache_progress(bytes_read: int, total: int) -> None:
+                if worker.is_cancelled:
+                    return
+                pct = round(bytes_read / total * 100) if total > 0 else 0
+                try:
+                    self.call_from_thread(self._set_progress, pct)
+                except Exception:
+                    pass
+
+            index = FileIndex.from_cache(
+                cache_path, self.input_file, progress_cb=cache_progress
+            )
+            if not worker.is_cancelled and index is not None:
+                try:
+                    self.call_from_thread(self._set_progress, 100)
+                    self.call_from_thread(self._on_index_ready, index)
+                except Exception:
+                    pass
+            return
 
         def progress_cb(bytes_read: int, total: int) -> None:
             if worker.is_cancelled:
@@ -170,17 +254,17 @@ class TreesizeApp(App[None]):
             cancelled=lambda: worker.is_cancelled,
         )
         if not worker.is_cancelled and index is not None:
+            self._was_indexed_fresh = True
             try:
                 self.call_from_thread(self._on_index_ready, index)
             except Exception:
                 pass
 
+    def _set_loading_label(self, text: str) -> None:
+        self.query_one("#loading-label", Label).update(text)
+
     def _set_progress(self, pct: int) -> None:
         self.query_one("#progress", ProgressBar).update(progress=pct, total=100)
-
-    def action_quit(self) -> None:
-        self._quitting = True
-        self.exit()
 
     def _on_index_ready(self, index: FileIndex) -> None:
         if self._quitting or not self.is_running:
@@ -191,6 +275,43 @@ class TreesizeApp(App[None]):
         self.query_one("#nav-list").display = True
         self.query_one("#sort-bar").display = True
         self.current_path = index.root
+
+    # ------------------------------------------------------------------ quit / save
+
+    def action_quit(self) -> None:
+        if not self._quitting and self._was_indexed_fresh and self._index is not None:
+            self.push_screen(
+                YesNoScreen("Save index for faster future loads?"),
+                self._on_quit_save_choice,
+            )
+            return
+        self._quitting = True
+        self.exit()
+
+    def _on_quit_save_choice(self, save: bool) -> None:
+        if save:
+            self.notify("Saving cache…")
+            self._run_save_then_exit()
+        else:
+            self._quitting = True
+            self.exit()
+
+    @work(thread=True, exit_on_error=False)
+    def _run_save_then_exit(self) -> None:
+        cache_path = self.input_file + ".tsnidx"
+        try:
+            assert self._index is not None
+            self._index.save_cache(cache_path, self.input_file)
+        except Exception:
+            pass
+        try:
+            self.call_from_thread(self._do_exit)
+        except Exception:
+            pass
+
+    def _do_exit(self) -> None:
+        self._quitting = True
+        self.exit()
 
     # ------------------------------------------------------------------ sort
 

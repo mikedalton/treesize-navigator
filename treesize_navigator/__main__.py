@@ -7,7 +7,10 @@ from .app import TreesizeApp
 def main() -> None:
     if len(sys.argv) != 2:
         print(f"Usage: {Path(sys.argv[0]).name} <find_output.txt>", file=sys.stderr)
-        print("  Generate input with: find /some/path -ls > snapshot.txt", file=sys.stderr)
+        print(
+            "  Generate input with: find /some/path -ls > snapshot.txt",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     input_file = sys.argv[1]
